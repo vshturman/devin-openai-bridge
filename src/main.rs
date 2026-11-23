@@ -417,7 +417,11 @@ async fn relay(
     let mut decoder = Decoder::new(names);
     decoder.live = live;
     let mut bytes = response.bytes_stream();
-    while let Some(part) = bytes.next().await {
+    let idle = if live { live::IDLE } else { DEADLINE };
+    while let Some(part) = tokio::time::timeout(idle, bytes.next())
+        .await
+        .map_err(|_| "upstream idle timeout exceeded")?
+    {
         let part = part.map_err(|_| "synthetic upstream read failed")?;
         let mut texts = Vec::new();
         let result = decoder.push_inner(&part, &mut texts);

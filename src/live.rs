@@ -13,7 +13,8 @@ const MAX_CATALOG: usize = 8 * 1024 * 1024;
 const QUOTA: &str =
     "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus";
 const MAX_QUOTA: usize = 1024 * 1024;
-pub const DEADLINE: Duration = Duration::from_secs(120);
+pub const DEADLINE: Duration = Duration::from_secs(900);
+pub const IDLE: Duration = Duration::from_secs(120);
 static REQUEST: AtomicU64 = AtomicU64::new(1);
 
 pub struct Credentials {
