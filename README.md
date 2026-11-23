@@ -69,7 +69,10 @@ checked-in files, or request logs.
 - Only enabled public non-router configs in normal display slots (0 or 8), with
   positive context/output limits, are eligible. Chat rejects unknown model IDs
   before generation. Output is limited to the lesser of the model limit and
-  4,096 tokens; omitted `max_tokens` uses that cap.
+  16,384 tokens, including reasoning; omitted `max_tokens` uses that capped
+  catalog limit. Clients may explicitly request a smaller budget. Token-limit
+  stops remain incomplete: buffered tools are withheld and nothing is automatically
+  retried.
 - Text system/user/assistant messages, function calls/results, and unsigned
   reasoning history. The client must resend the conversation history.
 - An optional `user` field provides session identity; use a distinct value for

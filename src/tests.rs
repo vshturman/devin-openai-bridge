@@ -77,6 +77,25 @@ fn incomplete_or_invalid_terminal_never_commits_tools() {
     assert!(decode(&[valid, vec![0]].concat()).is_err());
 }
 #[test]
+fn unsuccessful_finishes_preserve_reason_and_withhold_tools() {
+    for (reason, expected) in [
+        (1, "upstream finish: incomplete"),
+        (3, "upstream finish: max tokens"),
+        (5, "upstream finish: max newlines"),
+        (7, "upstream finish: nonfinite probability"),
+        (9, "upstream finish: partial"),
+        (11, "upstream finish: content filter"),
+        (13, "upstream finish: error"),
+        (14, "unsuccessful or unknown finish"),
+    ] {
+        let bytes = [tool("{}"), frame(0, &[40, reason]), frame(2, b"{}")].concat();
+        let mut decoder = Decoder::new(HashSet::from(["f".into()]));
+        decoder.live = true;
+        assert_eq!(decoder.push(&bytes).unwrap_err(), expected);
+    }
+}
+
+#[test]
 fn finish_tool_consistency_live_and_offline() {
     for live in [false, true] {
         for with_tool in [false, true] {

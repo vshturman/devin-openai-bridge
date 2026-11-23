@@ -170,7 +170,7 @@ pub fn decode_models(body: &[u8]) -> Result<Vec<Value>, &'static str> {
         let name = utf8(bytes(&config, 1)?)?;
         models.push(json!({"id":uid,"object":"model","owned_by":"devin",
             "name":if name.is_empty() { &uid } else { &name }, "context_window":context,
-            "max_output_tokens":output.min(4096),
+            "max_output_tokens":output.min(16384),
             "capabilities":{"tool_use":tools,"parallel_tool_calls":parallel,"images":false,
                 "reasoning":reasoning,"preserve_reasoning":preserve,"interleaved_reasoning":interleave,
                 "upstream_images":images}}));
@@ -300,9 +300,9 @@ pub fn validate(r: &Value) -> Result<HashSet<String>, &'static str> {
         return Err("a model UID and streaming are required");
     }
     if let Some(n) = r.get("max_tokens")
-        && !n.as_u64().is_some_and(|n| (1..=4096).contains(&n))
+        && !n.as_u64().is_some_and(|n| (1..=16384).contains(&n))
     {
-        return Err("max_tokens must be 1..4096");
+        return Err("max_tokens must be 1..16384");
     }
     if let Some(user) = r.get("user") {
         let s = nonempty(user)?;
@@ -550,7 +550,7 @@ fn encode(r: &Value, meta: &[u8], session: &str) -> Vec<u8> {
     v(&mut out, 7, 5);
     let mut options = Vec::new();
     v(&mut options, 1, 1);
-    v(&mut options, 2, r["max_tokens"].as_u64().unwrap_or(4096));
+    v(&mut options, 2, r["max_tokens"].as_u64().unwrap_or(16384));
     v(&mut options, 3, 400);
     fixed(&mut options, 5, 1.0);
     v(&mut options, 7, 40);
@@ -893,7 +893,7 @@ mod tests {
         let models = decode_models(&catalog_wire(&configs)).unwrap();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0]["context_window"], 200000);
-        assert_eq!(models[0]["max_output_tokens"], 4096);
+        assert_eq!(models[0]["max_output_tokens"], 16384);
         assert_eq!(models[1]["max_output_tokens"], 2048);
         assert_eq!(models[0]["capabilities"]["images"], false);
         for key in [
@@ -1074,7 +1074,7 @@ mod tests {
         assert!(validate(&request()).is_ok());
         for (key, value) in [
             ("model", json!("")),
-            ("max_tokens", json!(4097)),
+            ("max_tokens", json!(16385)),
             ("user", json!("../bad")),
             ("reasoning", json!("signed")),
         ] {
@@ -1083,6 +1083,23 @@ mod tests {
             assert!(validate(&r).is_err());
         }
     }
+    #[test]
+    fn reasoning_output_budget_is_bounded_by_catalog_and_bridge() {
+        let models =
+            decode_models(&catalog_wire(&[config(MODEL, false, 0, 200000, 64000)])).unwrap();
+        let mut r = request();
+        r["max_tokens"] = json!(16384);
+        assert!(validate(&r).is_ok());
+        select_model(&mut r, &models).unwrap();
+        assert_eq!(r["max_tokens"], 16384);
+        r["max_tokens"] = json!(16385);
+        assert!(validate(&r).is_err());
+        assert!(select_model(&mut r, &models).is_err());
+        r.as_object_mut().unwrap().remove("max_tokens");
+        select_model(&mut r, &models).unwrap();
+        assert_eq!(r["max_tokens"], 16384);
+    }
+
     #[test]
     fn parallel_tool_calls_accepts_only_booleans() {
         let mut r = request();

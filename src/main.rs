@@ -544,8 +544,16 @@ impl Decoder {
                     if self.finish.replace(n).is_some() {
                         return Err("duplicate finish");
                     }
-                    if !matches!(n, 0 | 2 | 4 | 6 | 8 | 10 | 12) {
-                        return Err("unsuccessful or unknown finish");
+                    match n {
+                        0 | 2 | 4 | 6 | 8 | 10 | 12 => {}
+                        1 => return Err("upstream finish: incomplete"),
+                        3 => return Err("upstream finish: max tokens"),
+                        5 => return Err("upstream finish: max newlines"),
+                        7 => return Err("upstream finish: nonfinite probability"),
+                        9 => return Err("upstream finish: partial"),
+                        11 => return Err("upstream finish: content filter"),
+                        13 => return Err("upstream finish: error"),
+                        _ => return Err("unsuccessful or unknown finish"),
                     }
                 }
                 (6, Field::Bytes(b)) => {
