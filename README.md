@@ -61,6 +61,12 @@ checked-in files, or request logs.
   `images` is always false: upstream image support is informational only, and
   image requests remain unsupported. Reasoning flags describe unsigned history,
   not signed/redacted state support.
+- `GET /v1/usage`, bearer-authenticated, returns account quota as
+  `{"daily":{"remaining_percent":N,"reset_at":UNIX},"weekly":{...}}`. Only
+  windows the provider reports are included; `reset_at` may be absent. Data comes
+  from the fixed HTTPS `GetUserStatus` RPC (15-second timeout, 1 MiB bound) and
+  is cached for 60 seconds. Accounts without quota access get HTTP 502; chat is
+  unaffected.
 - Catalogs come from the fixed HTTPS `GetCliModelConfigs` RPC, with a 30-second
   timeout and 8 MiB response bound. Successful results are shared for 15 minutes;
   GET and chat reuse the cache, refreshing lazily on expiry. No CLI or credential
@@ -77,6 +83,18 @@ checked-in files, or request logs.
   reasoning history. The client must resend the conversation history.
 - An optional `user` field provides session identity; use a distinct value for
   each independent conversation. Without it, each request gets a fresh identity.
+- Live requests mark the system prompt (when present) and last non-system message
+  as EPHEMERAL cache breakpoints, using that same session identity as the upstream
+  cache key. Cache reuse is upstream best-effort, not guaranteed; there is no
+  background warming or extra cache configuration.
+- With `stream_options: {"include_usage": true}`, successful live streams report
+  upstream usage before the final completion marker and `[DONE]`. `prompt_tokens`
+  includes uncached input, cache writes and cache reads; `completion_tokens` is
+  output and `total_tokens` is their sum. Reported cache reads appear in
+  `prompt_tokens_details.cached_tokens`, and writes in `cache_write_tokens` (an
+  extension in the same details object). Missing cache counters are omitted, not
+  inferred from latency; cumulative snapshots are merged rather than added.
+  Failed/incomplete streams do not emit success usage.
 - The client executes tools and must implement its own approval policy. This
   helper does not execute tools or supply an agent sandbox.
 - Unsupported fields are rejected. No Responses API, embeddings, images,

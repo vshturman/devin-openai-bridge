@@ -27,6 +27,7 @@ struct App {
     client: reqwest::Client,
     slots: Arc<Semaphore>,
     catalog: RwLock<Option<(std::time::Instant, Vec<Value>)>>,
+    quota: RwLock<Option<(std::time::Instant, Value)>>,
 }
 
 #[tokio::main]
@@ -60,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build()?,
         slots: Arc::new(Semaphore::new(5)),
         catalog: RwLock::new(None),
+        quota: RwLock::new(None),
     });
     let router = router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -72,6 +74,7 @@ fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/models", get(models))
+        .route("/v1/usage", get(usage))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(app)
 }
@@ -149,6 +152,42 @@ async fn models(State(app): State<Arc<App>>, request: Request) -> Response {
             .unwrap(),
         Err(message) => reject(StatusCode::BAD_GATEWAY, message),
     }
+}
+
+async fn usage(State(app): State<Arc<App>>, request: Request) -> Response {
+    if request
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        != Some(&format!("Bearer {}", app.key))
+    {
+        return reject(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+    let Some(credentials) = app.live.as_ref() else {
+        return reject(StatusCode::BAD_GATEWAY, "quota requires live credentials");
+    };
+    let mut cache = app.quota.write().await;
+    let data = match cache
+        .as_ref()
+        .filter(|(at, _)| at.elapsed() < Duration::from_secs(60))
+    {
+        Some((_, data)) => data.clone(),
+        None => {
+            *cache = None;
+            match live::fetch_quota(&app.client, credentials).await {
+                Ok(data) => {
+                    *cache = Some((std::time::Instant::now(), data.clone()));
+                    data
+                }
+                Err(message) => return reject(StatusCode::BAD_GATEWAY, message),
+            }
+        }
+    };
+    Response::builder()
+        .header("content-type", "application/json")
+        .header("cache-control", "no-store")
+        .body(Body::from(data.to_string()))
+        .unwrap()
 }
 
 async fn chat(State(app): State<Arc<App>>, request: Request) -> Response {
@@ -397,18 +436,19 @@ async fn relay(
             .await
             .map_err(|_| "client cancelled")?;
     }
-    if live && include_usage && !usage.is_null() {
-        tx.send(sse(json!({"id":"chatcmpl-devin","object":"chat.completion.chunk","model":model,"created":0,"choices":[],"usage":usage})))
-            .await.map_err(|_| "client cancelled")?;
-    }
-    tx.send(chunk(
-        json!({}),
-        json!(if tools.is_empty() {
-            "stop"
-        } else {
-            "tool_calls"
-        }),
-    ))
+    let finish = json!(if tools.is_empty() {
+        "stop"
+    } else {
+        "tool_calls"
+    });
+    tx.send(if live && include_usage && !usage.is_null() {
+        sse(
+            json!({"id":"chatcmpl-devin","object":"chat.completion.chunk","model":model,"created":0,
+            "choices":[{"index":0,"delta":{},"finish_reason":finish}],"usage":usage}),
+        )
+    } else {
+        chunk(json!({}), finish)
+    })
     .await
     .map_err(|_| "client cancelled")?;
     tx.send("data: [DONE]\n\n".to_owned())
@@ -447,6 +487,7 @@ struct Decoder {
     names: HashSet<String>,
     live: bool,
     usage: Value,
+    usage_counts: Value,
 }
 impl Decoder {
     fn new(names: HashSet<String>) -> Self {
@@ -461,6 +502,7 @@ impl Decoder {
             names,
             live: false,
             usage: Value::Null,
+            usage_counts: json!({}),
         }
     }
     #[cfg(test)]
@@ -606,19 +648,30 @@ impl Decoder {
                 }
                 (7 | 28, Field::Bytes(b)) if self.live => {
                     let counts = live::read_usage(b, number == 28)?;
-                    if self.usage.is_null() {
-                        self.usage =
-                            json!({"prompt_tokens":0,"completion_tokens":0,"total_tokens":0});
+                    if counts.is_empty() {
+                        continue;
                     }
                     for (key, value) in counts {
-                        self.usage[key] = json!(value);
+                        self.usage_counts[key] = json!(value);
                     }
-                    self.usage["total_tokens"] = json!(
-                        self.usage["prompt_tokens"]
-                            .as_u64()
-                            .unwrap_or(0)
-                            .saturating_add(self.usage["completion_tokens"].as_u64().unwrap_or(0))
-                    );
+                    let count = |key| self.usage_counts[key].as_u64().unwrap_or(0);
+                    let prompt = count("input_tokens")
+                        .checked_add(count("cache_write_tokens"))
+                        .and_then(|n| n.checked_add(count("cache_read_tokens")))
+                        .ok_or("usage count overflow")?;
+                    let completion = count("output_tokens");
+                    let total = prompt
+                        .checked_add(completion)
+                        .ok_or("usage count overflow")?;
+                    self.usage = json!({"prompt_tokens":prompt,"completion_tokens":completion,"total_tokens":total});
+                    for (source, detail) in [
+                        ("cache_read_tokens", "cached_tokens"),
+                        ("cache_write_tokens", "cache_write_tokens"),
+                    ] {
+                        if let Some(value) = self.usage_counts.get(source) {
+                            self.usage["prompt_tokens_details"][detail] = value.clone();
+                        }
+                    }
                 }
                 (number, field) if self.live => live::response_field(number, field)?,
                 _ => return Err("unsupported offline response field or wire type"),

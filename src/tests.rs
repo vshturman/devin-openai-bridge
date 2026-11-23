@@ -184,6 +184,7 @@ async fn authentication_and_admission_precede_upstream() {
         client: reqwest::Client::builder().no_proxy().build().unwrap(),
         slots: Arc::new(Semaphore::new(0)),
         catalog: RwLock::new(None),
+        quota: RwLock::new(None),
     });
     let request = json!({"model":"devin-offline","stream":true,"messages":[{"role":"user","content":"synthetic"}]});
     let response = chat(
@@ -222,6 +223,7 @@ impl HttpHelper {
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
             slots: Arc::new(Semaphore::new(1)),
             catalog: RwLock::new(None),
+            quota: RwLock::new(None),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -385,6 +387,7 @@ async fn downstream_drop_cancels_synthetic_upstream() {
         client: reqwest::Client::builder().no_proxy().build().unwrap(),
         slots: Arc::new(Semaphore::new(5)),
         catalog: RwLock::new(None),
+        quota: RwLock::new(None),
     });
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -489,6 +492,7 @@ async fn synthetic_upstream(payload: Vec<u8>, complete: bool) -> SyntheticUpstre
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
             slots: Arc::new(Semaphore::new(1)),
             catalog: RwLock::new(None),
+            quota: RwLock::new(None),
         }),
         task,
         sent,
@@ -730,20 +734,162 @@ async fn short_bridge_timeout_cancels_stalled_upstream_without_chat_deadline() {
     assert_eq!(fixture.app.slots.available_permits(), 1);
 }
 
+fn metric_usage(name: &str, value: f32) -> Vec<u8> {
+    let mut value_wire = vec![21];
+    value_wire.extend(value.to_le_bytes());
+    let mut metric = vec![34, value_wire.len() as u8];
+    metric.extend(value_wire);
+    metric.extend([42, name.len() as u8]);
+    metric.extend(name.as_bytes());
+    let mut metrics = vec![18, metric.len() as u8];
+    metrics.extend(metric);
+    let mut response = vec![226, 1, metrics.len() as u8];
+    response.extend(metrics);
+    frame(0, &response)
+}
+
+#[test]
+fn cache_usage_merges_cumulative_partial_native_and_metrics() {
+    for metrics_first in [false, true] {
+        let mut d = Decoder::new(HashSet::new());
+        d.live = true;
+        let native = frame(0, &[58, 8, 16, 3, 24, 2, 32, 5, 40, 7]);
+        let metrics = [
+            metric_usage("input_tokens", 3.0),
+            metric_usage("output_tokens", 2.0),
+            metric_usage("cache_write_tokens", 5.0),
+            metric_usage("cache_read_tokens", 7.0),
+        ]
+        .concat();
+        for snapshot in if metrics_first {
+            [&metrics, &native]
+        } else {
+            [&native, &metrics]
+        } {
+            for _ in 0..3 {
+                for byte in snapshot {
+                    d.push(&[*byte]).unwrap();
+                }
+                assert_eq!(
+                    d.usage,
+                    json!({"prompt_tokens":15,"completion_tokens":2,"total_tokens":17,
+                    "prompt_tokens_details":{"cached_tokens":7,"cache_write_tokens":5}})
+                );
+            }
+        }
+        d.push(&metric_usage("output_tokens", 4.0)).unwrap();
+        assert_eq!(d.usage["total_tokens"], 19);
+        d.push(&frame(0, &[58, 2, 40, 9])).unwrap();
+        assert_eq!(d.usage["prompt_tokens"], 17);
+        assert_eq!(d.usage["total_tokens"], 21);
+        d.push(&metric_usage("cache_read_tokens", 0.0)).unwrap();
+        assert_eq!(d.usage["prompt_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(d.usage["prompt_tokens_details"]["cache_write_tokens"], 5);
+        assert_eq!(d.usage["total_tokens"], 12);
+    }
+}
+
+#[test]
+fn cache_usage_does_not_invent_missing_counters() {
+    let mut d = Decoder::new(HashSet::new());
+    d.live = true;
+    for empty in [
+        frame(0, &[58, 0]),
+        metric_usage("unrelated", 3.0),
+        metric_usage("unrelated", 1.5),
+        metric_usage("unrelated", f32::MAX),
+    ] {
+        d.push(&empty).unwrap();
+        assert!(d.usage.is_null());
+    }
+    d.push(&frame(0, &[58, 4, 16, 3, 24, 2])).unwrap();
+    assert_eq!(
+        d.usage,
+        json!({"prompt_tokens":3,"completion_tokens":2,"total_tokens":5})
+    );
+    d.push(&metric_usage("cache_write_tokens", 5.0)).unwrap();
+    assert_eq!(
+        d.usage["prompt_tokens_details"],
+        json!({"cache_write_tokens":5})
+    );
+    assert_eq!(d.usage["prompt_tokens"], 8);
+    assert_eq!(d.usage["total_tokens"], 10);
+    d.push(&metric_usage("cache_creation_tokens", 6.0)).unwrap();
+    d.push(&metric_usage("cached_tokens", 7.0)).unwrap();
+    assert_eq!(
+        d.usage,
+        json!({"prompt_tokens":16,"completion_tokens":2,"total_tokens":18,
+            "prompt_tokens_details":{"cache_write_tokens":6,"cached_tokens":7}})
+    );
+}
+
+#[test]
+fn cache_usage_rejects_invalid_numbers_and_overflow() {
+    for value in [
+        f32::NAN,
+        f32::INFINITY,
+        -1.0,
+        -0.0,
+        1.5,
+        18446744073709551616.0,
+    ] {
+        for metric in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cache_creation_tokens",
+            "cached_tokens",
+            "unrelated",
+        ] {
+            let mut d = Decoder::new(HashSet::new());
+            d.live = true;
+            assert_eq!(
+                d.push(&metric_usage(metric, value)).is_err(),
+                metric != "unrelated" || !value.is_finite() || value.is_sign_negative(),
+                "{metric}: {value}"
+            );
+        }
+    }
+    let mut d = Decoder::new(HashSet::new());
+    d.live = true;
+    d.push(&metric_usage(
+        "cache_read_tokens",
+        f32::from_bits((2.0_f32.powi(64)).to_bits() - 1),
+    ))
+    .unwrap();
+    assert_eq!(d.usage["prompt_tokens"], 18446742974197923840_u64);
+    for extra in [24, 32, 40] {
+        let mut d = Decoder::new(HashSet::new());
+        d.live = true;
+        let mut stats = vec![16];
+        stats.extend([255; 9]);
+        stats.push(1);
+        stats.extend([extra, 1]);
+        let mut response = vec![58, stats.len() as u8];
+        response.extend(stats);
+        assert_eq!(d.push(&frame(0, &response)), Err("usage count overflow"));
+    }
+}
+
 #[tokio::test]
 async fn live_relay_synthetic_http_eof_and_usage() {
-    for (valid, reason) in [
-        (true, 0),
-        (true, 2),
-        (true, 4),
-        (true, 6),
-        (true, 8),
-        (true, 10),
-        (true, 12),
-        (false, 2),
+    for (valid, reason, include_usage) in [
+        (true, 0, true),
+        (true, 2, true),
+        (true, 4, true),
+        (true, 6, true),
+        (true, 8, true),
+        (true, 10, true),
+        (true, 12, true),
+        (false, 2, true),
+        (false, 13, true),
+        (true, 2, false),
     ] {
         let payload = [
             text("BETA_OK"),
+            frame(0, &[58, 4, 32, 5, 40, 7]),
+            metric_usage("cache_read_tokens", 7.0),
             frame(
                 0,
                 &[
@@ -770,7 +916,7 @@ async fn live_relay_synthetic_http_eof_and_usage() {
             HashSet::from(["f".into()]),
             &tx,
             true,
-            true,
+            include_usage,
             if reason % 4 == 0 {
                 "swe-2-flash-medium"
             } else {
@@ -802,11 +948,24 @@ async fn live_relay_synthetic_http_eof_and_usage() {
         assert_eq!(result.is_ok(), valid);
         assert_eq!(output.contains("[DONE]"), valid);
         assert_eq!(output.contains("tool_calls"), valid);
-        assert_eq!(output.contains("\"total_tokens\":5"), valid);
-        if valid {
-            let usage = output.find("\"total_tokens\":5").unwrap();
-            let finish = output.find("\"finish_reason\":\"tool_calls\"").unwrap();
-            assert!(usage < finish);
+        assert_eq!(output.contains("\"usage\":"), valid && include_usage);
+        if valid && include_usage {
+            assert_eq!(output.matches("\"usage\":").count(), 1);
+            let events: Vec<_> = output
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .collect();
+            assert_eq!(events.last(), Some(&"[DONE]"));
+            let event: Value = serde_json::from_str(events[events.len() - 2]).unwrap();
+            assert_eq!(
+                event["choices"],
+                json!([{"index":0,"delta":{},"finish_reason":"tool_calls"}])
+            );
+            assert_eq!(
+                event["usage"],
+                json!({"prompt_tokens":15,"completion_tokens":2,"total_tokens":17,
+                "prompt_tokens_details":{"cached_tokens":7,"cache_write_tokens":5}})
+            );
         }
     }
 }
@@ -947,6 +1106,7 @@ async fn request_capacity_and_json_rejections() {
         client: reqwest::Client::builder().no_proxy().build().unwrap(),
         slots: Arc::new(Semaphore::new(1)),
         catalog: RwLock::new(None),
+        quota: RwLock::new(None),
     });
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1003,6 +1163,28 @@ async fn request_capacity_and_json_rejections() {
     let error: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(error["error"]["message"], "invalid JSON request body");
     permits_recovered(&app).await;
+}
+
+#[tokio::test]
+async fn usage_requires_authentication_and_live_credentials() {
+    let helper = HttpHelper::start().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://{}/v1/usage", helper.address);
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    *helper.app.quota.write().await = Some((std::time::Instant::now(), json!({"daily":{}})));
+    assert_eq!(
+        client
+            .get(&url)
+            .header("authorization", format!("Bearer {}", helper.app.key))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
 }
 
 #[tokio::test]

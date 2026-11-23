@@ -10,6 +10,9 @@ const AUTH: &str = "https://server.codeium.com/exa.auth_pb.AuthService/GetUserJw
 const MODELS: &str =
     "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetCliModelConfigs";
 const MAX_CATALOG: usize = 8 * 1024 * 1024;
+const QUOTA: &str =
+    "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus";
+const MAX_QUOTA: usize = 1024 * 1024;
 pub const DEADLINE: Duration = Duration::from_secs(120);
 static REQUEST: AtomicU64 = AtomicU64::new(1);
 
@@ -79,6 +82,110 @@ async fn read_models(request: reqwest::RequestBuilder) -> Result<Vec<Value>, &'s
     })
     .await
     .map_err(|_| "catalog deadline exceeded")?
+}
+
+pub async fn fetch_quota(client: &reqwest::Client, c: &Credentials) -> Result<Value, &'static str> {
+    let os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    };
+    let body = json!({"metadata":{"api_key":c.api_key,"ide_name":"devin-desktop",
+        "ide_version":c.version,"extension_name":"devin-desktop",
+        "extension_version":c.version,"locale":"en","os":os}});
+    read_quota(
+        client
+            .post(QUOTA)
+            .header("content-type", "application/json")
+            .header("Connect-Protocol-Version", "1")
+            .header("Accept-Encoding", "identity")
+            .bearer_auth(&c.api_key)
+            .body(body.to_string()),
+    )
+    .await
+}
+
+async fn read_quota(request: reqwest::RequestBuilder) -> Result<Value, &'static str> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let response = request
+            .send()
+            .await
+            .map_err(|_| "quota connection failed")?;
+        if matches!(response.status().as_u16(), 401 | 403) {
+            return Err("quota unavailable for this account");
+        }
+        check_response(&response, "application/json")?;
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(part) = stream.next().await {
+            let part = part.map_err(|_| "quota read failed")?;
+            if part.len() > MAX_QUOTA - body.len() {
+                return Err("quota response limit");
+            }
+            body.extend(part);
+        }
+        decode_quota(&serde_json::from_slice(&body).map_err(|_| "invalid quota response")?)
+    })
+    .await
+    .map_err(|_| "quota deadline exceeded")?
+}
+
+pub fn decode_quota(root: &Value) -> Result<Value, &'static str> {
+    let get = |v: &Value, camel: &str, snake: &str| -> Value {
+        v.get(camel)
+            .or_else(|| v.get(snake))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let plan = get(
+        &get(root, "userStatus", "user_status"),
+        "planStatus",
+        "plan_status",
+    );
+    let mut out = json!({});
+    for (window, percent, reset) in [
+        (
+            "daily",
+            (
+                "dailyQuotaRemainingPercent",
+                "daily_quota_remaining_percent",
+            ),
+            ("dailyQuotaResetAtUnix", "daily_quota_reset_at_unix"),
+        ),
+        (
+            "weekly",
+            (
+                "weeklyQuotaRemainingPercent",
+                "weekly_quota_remaining_percent",
+            ),
+            ("weeklyQuotaResetAtUnix", "weekly_quota_reset_at_unix"),
+        ),
+    ] {
+        let remaining = get(&plan, percent.0, percent.1);
+        if remaining.is_null() {
+            continue;
+        }
+        let remaining = remaining
+            .as_f64()
+            .filter(|p| (0.0..=100.0).contains(p))
+            .ok_or("invalid quota percentage")?;
+        out[window] = json!({"remaining_percent": remaining});
+        let reset = get(&plan, reset.0, reset.1);
+        let reset = match &reset {
+            Value::Null => None,
+            Value::String(s) => Some(s.parse::<u64>().map_err(|_| "invalid quota reset")?),
+            v => Some(v.as_u64().ok_or("invalid quota reset")?),
+        };
+        if let Some(reset) = reset.filter(|r| *r > 0) {
+            out[window]["reset_at"] = json!(reset);
+        }
+    }
+    if out.as_object().unwrap().is_empty() {
+        return Err("quota not reported for this account");
+    }
+    Ok(out)
 }
 
 // Reject ambiguous consumed singular fields instead of protobuf's last-wins behavior.
@@ -507,8 +614,10 @@ fn encode(r: &Value, meta: &[u8], session: &str) -> Vec<u8> {
         .collect();
     if !system.is_empty() {
         s(&mut out, 2, &system.join("\n\n"));
+        b(&mut out, 13, &[8, 1]);
     }
-    for m in messages.iter().filter(|m| m["role"] != "system") {
+    let mut prompts = messages.iter().filter(|m| m["role"] != "system").peekable();
+    while let Some(m) = prompts.next() {
         let mut p = Vec::new();
         v(
             &mut p,
@@ -544,6 +653,9 @@ fn encode(r: &Value, meta: &[u8], session: &str) -> Vec<u8> {
                 s(&mut call, 3, c["function"]["arguments"].as_str().unwrap());
                 b(&mut p, 6, &call);
             }
+        }
+        if prompts.peek().is_none() {
+            b(&mut p, 8, &[8, 1]);
         }
         b(&mut out, 3, &p);
     }
@@ -598,6 +710,7 @@ fn encode(r: &Value, meta: &[u8], session: &str) -> Vec<u8> {
     s(&mut out, 16, &format!("{session}-cascade"));
     v(&mut out, 20, 1);
     s(&mut out, 21, r["model"].as_str().unwrap());
+    s(&mut out, 27, session);
     out
 }
 fn headers(client: &reqwest::Client, url: &str, unary: bool) -> reqwest::RequestBuilder {
@@ -764,17 +877,27 @@ pub fn response_field(n: u64, f: Field<'_>) -> Result<(), &'static str> {
     }
     Ok(())
 }
+fn token_metric(name: &str) -> Option<&'static str> {
+    match name {
+        "input_tokens" => Some("input_tokens"),
+        "output_tokens" => Some("output_tokens"),
+        "cache_write_tokens" | "cache_creation_tokens" => Some("cache_write_tokens"),
+        "cache_read_tokens" | "cached_tokens" => Some("cache_read_tokens"),
+        _ => None,
+    }
+}
 pub fn read_usage(bytes: &[u8], metrics: bool) -> Result<Vec<(&'static str, u64)>, &'static str> {
     usage(bytes, metrics)?;
     let mut out = Vec::new();
     for (n, f) in fields(bytes)? {
         if !metrics {
-            if let (2 | 3, Field::Varint(v)) = (n, f) {
+            if let (2..=5, Field::Varint(v)) = (n, f) {
                 out.push((
-                    if n == 2 {
-                        "prompt_tokens"
-                    } else {
-                        "completion_tokens"
+                    match n {
+                        2 => "input_tokens",
+                        3 => "output_tokens",
+                        4 => "cache_write_tokens",
+                        _ => "cache_read_tokens",
                     },
                     v,
                 ));
@@ -788,12 +911,9 @@ pub fn read_usage(bytes: &[u8], metrics: bool) -> Result<Vec<(&'static str, u64)
                     (4, Field::Bytes(b)) => {
                         for (n, f) in fields(b)? {
                             if let (2, Field::Fixed(b)) = (n, f) {
-                                value = Some(
-                                    f32::from_le_bytes(
-                                        b.try_into().map_err(|_| "incorrect float width")?,
-                                    )
-                                    .round() as u64,
-                                );
+                                value = Some(f32::from_le_bytes(
+                                    b.try_into().map_err(|_| "incorrect float width")?,
+                                ) as u64);
                             }
                         }
                     }
@@ -801,11 +921,7 @@ pub fn read_usage(bytes: &[u8], metrics: bool) -> Result<Vec<(&'static str, u64)
                 }
             }
             if let (Some(metric), Some(value)) = (metric, value)
-                && let Some(key) = match metric.as_str() {
-                    "input_tokens" => Some("prompt_tokens"),
-                    "output_tokens" => Some("completion_tokens"),
-                    _ => None,
-                }
+                && let Some(key) = token_metric(&metric)
             {
                 out.push((key, value));
             }
@@ -823,11 +939,16 @@ fn usage(bytes: &[u8], metrics: bool) -> Result<(), &'static str> {
             let Field::Bytes(b) = f else {
                 return Err("incorrect metrics wire type");
             };
-            for (n, f) in fields(b)? {
+            let fs = fields(b)?;
+            let mut token = false;
+            for (n, f) in &fs {
+                if let (5, Field::Bytes(b)) = (n, f) {
+                    token |= token_metric(&utf8(b)?).is_some();
+                }
+            }
+            for (n, f) in fs {
                 match (n, f) {
-                    (5, Field::Bytes(b)) => {
-                        utf8(b)?;
-                    }
+                    (5, Field::Bytes(_)) => {}
                     (4, Field::Bytes(b)) => {
                         for (n, f) in fields(b)? {
                             if n == 2 {
@@ -838,7 +959,12 @@ fn usage(bytes: &[u8], metrics: bool) -> Result<(), &'static str> {
                                     return Err("incorrect metric width");
                                 }
                                 let value = f32::from_le_bytes(b.try_into().unwrap());
-                                if !value.is_finite() || value.is_sign_negative() {
+                                if !value.is_finite()
+                                    || value.is_sign_negative()
+                                    || (token
+                                        && (value.fract() != 0.0
+                                            || value >= 18446744073709551616.0))
+                                {
                                     return Err("invalid metric count");
                                 }
                             }
@@ -1024,6 +1150,97 @@ mod tests {
             server.abort();
         }
     }
+    #[test]
+    fn quota_decodes_only_reported_windows() {
+        let camel = json!({"userStatus":{"email":"private","planStatus":{
+            "dailyQuotaRemainingPercent":62.5,"dailyQuotaResetAtUnix":"1800000000",
+            "weeklyQuotaRemainingPercent":100}}});
+        assert_eq!(
+            decode_quota(&camel).unwrap(),
+            json!({"daily":{"remaining_percent":62.5,"reset_at":1800000000_u64},
+                   "weekly":{"remaining_percent":100.0}})
+        );
+        let snake = json!({"user_status":{"plan_status":{
+            "weekly_quota_remaining_percent":0,"weekly_quota_reset_at_unix":1800000001_u64}}});
+        assert_eq!(
+            decode_quota(&snake).unwrap(),
+            json!({"weekly":{"remaining_percent":0.0,"reset_at":1800000001_u64}})
+        );
+        for bad in [
+            json!({}),
+            json!({"userStatus":{"planStatus":{}}}),
+            json!({"userStatus":{"planStatus":{"dailyQuotaRemainingPercent":101}}}),
+            json!({"userStatus":{"planStatus":{"dailyQuotaRemainingPercent":-1}}}),
+            json!({"userStatus":{"planStatus":{"dailyQuotaRemainingPercent":"50"}}}),
+            json!({"userStatus":{"planStatus":{"dailyQuotaRemainingPercent":5,
+                "dailyQuotaResetAtUnix":"soon"}}}),
+        ] {
+            assert!(decode_quota(&bad).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn quota_transport_is_bounded_and_strict() {
+        let good = br#"{"userStatus":{"planStatus":{"dailyQuotaRemainingPercent":40}}}"#;
+        for (status, content_type, body, expected) in [
+            (200, "application/json", good.to_vec(), Ok(())),
+            (
+                403,
+                "application/json",
+                vec![],
+                Err("quota unavailable for this account"),
+            ),
+            (
+                302,
+                "application/json",
+                vec![],
+                Err("unexpected live response status/encoding"),
+            ),
+            (
+                200,
+                "text/html",
+                good.to_vec(),
+                Err("unexpected live response status/encoding"),
+            ),
+            (
+                200,
+                "application/json",
+                b"{".to_vec(),
+                Err("invalid quota response"),
+            ),
+            (
+                200,
+                "application/json",
+                vec![b' '; MAX_QUOTA + 1],
+                Err("quota response limit"),
+            ),
+        ] {
+            let app = Router::new().route(
+                "/",
+                post(move || async move {
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", content_type)
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            assert_eq!(
+                read_quota(client.post(format!("http://{address}/")))
+                    .await
+                    .map(|_| ()),
+                expected
+            );
+            server.abort();
+        }
+    }
     #[tokio::test]
     async fn chat_structure_precedes_discovery_and_unknown_models_never_generate() {
         let c = parse_bootstrap(br#"{"api_key":"synthetic","client_version":"1.2.3"}"#).unwrap();
@@ -1034,6 +1251,7 @@ mod tests {
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
             slots: Arc::new(Semaphore::new(1)),
             catalog: RwLock::new(None),
+            quota: RwLock::new(None),
         });
         let send = |value: Value| {
             let mut req = Request::new(Body::from(value.to_string()));
@@ -1268,6 +1486,65 @@ mod tests {
         assert!(validate(&r).is_err());
         r["messages"][2]["reasoning"] = json!("a");
         assert!(validate(&r).is_ok());
+    }
+    #[test]
+    fn cache_breakpoints_and_session_namespace() {
+        for messages in [
+            json!([]),
+            json!([{"role":"system","content":"sys"}]),
+            json!([{"role":"user","content":"first"}]),
+            json!([{"role":"system","content":"sys"},{"role":"user","content":"first"},{"role":"assistant","content":"answer"},{"role":"tool","content":"result","tool_call_id":"id"},{"role":"system","content":"tail"}]),
+        ] {
+            let r = json!({"model":MODEL,"messages":messages});
+            let wire = encode(&r, b"meta", "session");
+            assert_eq!(wire, encode(&r, b"meta", "session"));
+            let fs = fields(&wire).unwrap();
+            let system = messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["role"] == "system");
+            assert_eq!(
+                fs.iter().filter(|(n, _)| *n == 13).count(),
+                usize::from(system)
+            );
+            if system {
+                assert_eq!(number(&fields(bytes(&fs, 13).unwrap()).unwrap(), 1), Ok(1));
+            }
+            let prompts: Vec<_> = fs
+                .iter()
+                .filter_map(|(n, f)| match (n, f) {
+                    (3, Field::Bytes(b)) => Some(fields(b).unwrap()),
+                    _ => None,
+                })
+                .collect();
+            for (i, prompt) in prompts.iter().enumerate() {
+                assert_eq!(
+                    prompt.iter().filter(|(n, _)| *n == 8).count(),
+                    usize::from(i + 1 == prompts.len())
+                );
+                if i + 1 == prompts.len() {
+                    assert_eq!(
+                        number(&fields(bytes(prompt, 8).unwrap()).unwrap(), 1),
+                        Ok(1)
+                    );
+                }
+            }
+            assert_eq!(bytes(&fs, 27).unwrap(), b"session");
+            let mut appended = r.clone();
+            appended["messages"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"role":"user","content":"next"}));
+            let next_wire = encode(&appended, b"different-meta", "session");
+            let next = fields(&next_wire).unwrap();
+            let other_wire = encode(&r, b"meta", "other-session");
+            let other = fields(&other_wire).unwrap();
+            for n in [15, 16, 27] {
+                assert_eq!(bytes(&fs, n).unwrap(), bytes(&next, n).unwrap());
+                assert_ne!(bytes(&fs, n).unwrap(), bytes(&other, n).unwrap());
+            }
+        }
     }
     #[test]
     fn same_frame_finish_tool_empty_reasoning_metadata_and_usage() {
