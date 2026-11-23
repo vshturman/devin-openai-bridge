@@ -89,5 +89,6 @@ release binaries with remapped build paths, packages only the executable, verifi
 checksums and publishes a release only after every target succeeds. Tagging and
 publishing are maintainer actions, not performed by local builds.
 
-No license has been selected yet. Public visibility alone does not grant a
-license to reuse or redistribute the code.
+## License
+
+MIT. See [LICENSE](LICENSE).
