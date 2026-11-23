@@ -164,6 +164,7 @@ async fn authentication_and_admission_precede_upstream() {
         upstream: offline_url("http://127.0.0.1:1").unwrap(),
         client: reqwest::Client::builder().no_proxy().build().unwrap(),
         slots: Arc::new(Semaphore::new(0)),
+        catalog: RwLock::new(None),
     });
     let request = json!({"model":"devin-offline","stream":true,"messages":[{"role":"user","content":"synthetic"}]});
     let response = chat(
@@ -201,6 +202,7 @@ impl HttpHelper {
             upstream: offline_url("http://127.0.0.1:1").unwrap(),
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
             slots: Arc::new(Semaphore::new(1)),
+            catalog: RwLock::new(None),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -363,6 +365,7 @@ async fn downstream_drop_cancels_synthetic_upstream() {
         upstream: offline_url(&format!("http://{address}")).unwrap(),
         client: reqwest::Client::builder().no_proxy().build().unwrap(),
         slots: Arc::new(Semaphore::new(5)),
+        catalog: RwLock::new(None),
     });
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -466,6 +469,7 @@ async fn synthetic_upstream(payload: Vec<u8>, complete: bool) -> SyntheticUpstre
             upstream: offline_url(&format!("http://{address}")).unwrap(),
             client: reqwest::Client::builder().no_proxy().build().unwrap(),
             slots: Arc::new(Semaphore::new(1)),
+            catalog: RwLock::new(None),
         }),
         task,
         sent,
@@ -742,14 +746,40 @@ async fn live_relay_synthetic_http_eof_and_usage() {
             .await
             .unwrap();
         let (tx, mut rx) = mpsc::channel(16);
-        let result = relay(response, HashSet::from(["f".into()]), &tx, true, true).await;
+        let result = relay(
+            response,
+            HashSet::from(["f".into()]),
+            &tx,
+            true,
+            true,
+            if reason % 4 == 0 {
+                "swe-2-flash-medium"
+            } else {
+                "second-model"
+            },
+        )
+        .await;
         drop(tx);
         let mut output = String::new();
         while let Some(part) = rx.recv().await {
             output.push_str(&part);
         }
         assert!(output.contains("BETA_OK"));
-        assert!(output.contains("swe-2-flash-medium"));
+        let model = if reason % 4 == 0 {
+            "swe-2-flash-medium"
+        } else {
+            "second-model"
+        };
+        for event in output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+        {
+            if event == "[DONE]" {
+                continue;
+            }
+            let event: Value = serde_json::from_str(event).unwrap();
+            assert_eq!(event["model"], model);
+        }
         assert_eq!(result.is_ok(), valid);
         assert_eq!(output.contains("[DONE]"), valid);
         assert_eq!(output.contains("tool_calls"), valid);
@@ -764,7 +794,14 @@ async fn live_relay_synthetic_http_eof_and_usage() {
 
 #[tokio::test]
 async fn unsigned_reasoning_stream_and_late_signatures_gate_tools() {
-    for tail in [None, Some((10, false)), Some((21, false)), Some((11, true))] {
+    for tail in [
+        None,
+        Some((10, false)),
+        Some((20, false)),
+        Some((20, true)),
+        Some((21, false)),
+        Some((11, true)),
+    ] {
         let mut reasoning = vec![74, "visible thinking 🦀".len() as u8];
         reasoning.extend("visible thinking 🦀".as_bytes());
         let mut payload = [
@@ -776,9 +813,17 @@ async fn unsigned_reasoning_stream_and_late_signatures_gate_tools() {
         .concat();
         if let Some((number, varint)) = tail {
             let signature = if varint {
-                vec![88, 1]
+                if number == 20 {
+                    vec![160, 1, 1]
+                } else {
+                    vec![88, 1]
+                }
             } else {
-                let mut field = if number == 10 { vec![82] } else { vec![170, 1] };
+                let mut field = match number {
+                    10 => vec![82],
+                    20 => vec![162, 1],
+                    _ => vec![170, 1],
+                };
                 field.extend([6]);
                 field.extend(b"signed");
                 field
@@ -796,7 +841,15 @@ async fn unsigned_reasoning_stream_and_late_signatures_gate_tools() {
             .await
             .unwrap();
         let (tx, mut rx) = mpsc::channel(16);
-        let result = relay(response, HashSet::from(["f".into()]), &tx, true, false).await;
+        let result = relay(
+            response,
+            HashSet::from(["f".into()]),
+            &tx,
+            true,
+            false,
+            "second-model",
+        )
+        .await;
         drop(tx);
         let mut events = Vec::new();
         while let Some(event) = rx.recv().await {
@@ -811,11 +864,12 @@ async fn unsigned_reasoning_stream_and_late_signatures_gate_tools() {
         let text: Value =
             serde_json::from_str(events[1].trim().strip_prefix("data: ").unwrap()).unwrap();
         assert_eq!(text["choices"][0]["delta"], json!({"content":"answer"}));
-        if let Some((number, _)) = tail {
+        if let Some((number, varint)) = tail {
             assert_eq!(
                 result,
                 Err(match number {
                     10 => "nonempty signature unsupported",
+                    20 if !varint => "nonempty Gemini signature unsupported",
                     21 => "nonempty signature type unsupported",
                     _ => "unsupported reasoning or incorrect wire type",
                 })
@@ -873,6 +927,7 @@ async fn request_capacity_and_json_rejections() {
         upstream: offline_url("http://127.0.0.1:1").unwrap(),
         client: reqwest::Client::builder().no_proxy().build().unwrap(),
         slots: Arc::new(Semaphore::new(1)),
+        catalog: RwLock::new(None),
     });
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -929,4 +984,39 @@ async fn request_capacity_and_json_rejections() {
     let error: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(error["error"]["message"], "invalid JSON request body");
     permits_recovered(&app).await;
+}
+
+#[tokio::test]
+async fn authenticated_models_http_and_cache_expiry_fail_closed() {
+    let helper = HttpHelper::start().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://{}/v1/models", helper.address);
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let get = || {
+        client
+            .get(&url)
+            .header("authorization", format!("Bearer {}", helper.app.key))
+    };
+    assert_eq!(
+        get().send().await.unwrap().status(),
+        StatusCode::BAD_GATEWAY
+    );
+    let data = vec![
+        json!({"id":"one","object":"model","owned_by":"devin","context_window":10000,"max_output_tokens":4096,"capabilities":{"tool_use":true,"images":false}}),
+    ];
+    *helper.app.catalog.write().await = Some((std::time::Instant::now(), data.clone()));
+    let response = get().send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body: Value = serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(body, json!({"object":"list","data":data}));
+    *helper.app.catalog.write().await =
+        Some((std::time::Instant::now() - Duration::from_secs(901), data));
+    assert_eq!(
+        get().send().await.unwrap().status(),
+        StatusCode::BAD_GATEWAY
+    );
 }

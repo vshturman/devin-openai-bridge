@@ -7,13 +7,207 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const CHAT: &str =
     "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage";
 const AUTH: &str = "https://server.codeium.com/exa.auth_pb.AuthService/GetUserJwt";
-pub const MODEL: &str = "swe-2-flash-medium";
+const MODELS: &str =
+    "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetCliModelConfigs";
+const MAX_CATALOG: usize = 8 * 1024 * 1024;
 pub const DEADLINE: Duration = Duration::from_secs(120);
 static REQUEST: AtomicU64 = AtomicU64::new(1);
 
 pub struct Credentials {
     api_key: String,
     version: String,
+}
+
+fn discovery_request(c: &Credentials) -> Vec<u8> {
+    let mut meta = Vec::new();
+    for (field, text) in [
+        (1, "chisel"),
+        (12, "chisel"),
+        (2, "0.0.0-dev"),
+        (7, "0.0.0-dev"),
+        (3, c.api_key.as_str()),
+        (4, "en"),
+        (
+            5,
+            if cfg!(target_os = "macos") {
+                "darwin"
+            } else if cfg!(target_os = "windows") {
+                "windows"
+            } else {
+                "linux"
+            },
+        ),
+    ] {
+        s(&mut meta, field, text);
+    }
+    b(&mut meta, 30, &[3, 4, 6, 7, 8]);
+    let mut out = Vec::new();
+    b(&mut out, 1, &meta);
+    out
+}
+
+pub async fn fetch_models(
+    client: &reqwest::Client,
+    c: &Credentials,
+) -> Result<Vec<Value>, &'static str> {
+    read_models(headers(client, MODELS, true).body(discovery_request(c))).await
+}
+
+async fn read_models(request: reqwest::RequestBuilder) -> Result<Vec<Value>, &'static str> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let response = request
+            .send()
+            .await
+            .map_err(|_| "catalog connection failed")?;
+        check_response(&response, "application/proto")?;
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_CATALOG as u64)
+        {
+            return Err("catalog response limit");
+        }
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(part) = stream.next().await {
+            let part = part.map_err(|_| "catalog read failed")?;
+            if part.len() > MAX_CATALOG - body.len() {
+                return Err("catalog response limit");
+            }
+            body.extend(part);
+        }
+        decode_models(&body)
+    })
+    .await
+    .map_err(|_| "catalog deadline exceeded")?
+}
+
+// Reject ambiguous consumed singular fields instead of protobuf's last-wins behavior.
+fn number(fs: &[(u64, Field<'_>)], field: u64) -> Result<u64, &'static str> {
+    let mut value = None;
+    for (_, f) in fs.iter().filter(|(n, _)| *n == field) {
+        let Field::Varint(v) = f else {
+            return Err("invalid catalog number");
+        };
+        if value.replace(*v).is_some() {
+            return Err("duplicate catalog field");
+        }
+    }
+    Ok(value.unwrap_or(0))
+}
+fn bytes<'a>(fs: &[(u64, Field<'a>)], field: u64) -> Result<&'a [u8], &'static str> {
+    let mut value = None;
+    for (_, f) in fs.iter().filter(|(n, _)| *n == field) {
+        let Field::Bytes(v) = f else {
+            return Err("invalid catalog bytes");
+        };
+        if value.replace(*v).is_some() {
+            return Err("duplicate catalog field");
+        }
+    }
+    Ok(value.unwrap_or(&[]))
+}
+fn flag(fs: &[(u64, Field<'_>)], field: u64) -> Result<bool, &'static str> {
+    match number(fs, field)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err("invalid catalog boolean"),
+    }
+}
+
+pub fn decode_models(body: &[u8]) -> Result<Vec<Value>, &'static str> {
+    if body.len() > MAX_CATALOG {
+        return Err("catalog response limit");
+    }
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for (n, f) in fields_limit(body, 16384)? {
+        if n != 1 {
+            continue;
+        }
+        let Field::Bytes(config) = f else {
+            return Err("invalid model config");
+        };
+        let config = fields(config)?;
+        let info = fields(bytes(&config, 23)?)?;
+        if flag(&config, 4)?
+            || flag(&info, 2)?
+            || flag(&info, 25)?
+            || !matches!(number(&info, 22)?, 0 | 8)
+        {
+            continue;
+        }
+        let uid = utf8(bytes(&config, 22)?)?;
+        if uid.is_empty()
+            || uid.len() > 256
+            || uid.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return Err("invalid catalog UID");
+        }
+        let info_uid = bytes(&info, 17)?;
+        if !info_uid.is_empty() && info_uid != uid.as_bytes() {
+            return Err("conflicting catalog UID");
+        }
+        let override_context = number(&config, 18)?;
+        let context = if override_context > 0 {
+            override_context
+        } else {
+            number(&info, 4)?
+        };
+        let output = number(&info, 13)?;
+        if context == 0 || context > i32::MAX as u64 || output == 0 || output > i32::MAX as u64 {
+            return Err("invalid catalog token limits");
+        }
+        let features = fields(bytes(&info, 6)?)?;
+        let tools = flag(&features, 12)?;
+        let parallel = flag(&features, 21)?;
+        let reasoning = flag(&features, 15)?;
+        let images = flag(&features, 11)?;
+        let preserve = flag(&features, 25)?;
+        let interleave = flag(&features, 24)?;
+        if !seen.insert(uid.clone()) {
+            return Err("duplicate catalog UID");
+        }
+        let name = utf8(bytes(&config, 1)?)?;
+        models.push(json!({"id":uid,"object":"model","owned_by":"devin",
+            "name":if name.is_empty() { &uid } else { &name }, "context_window":context,
+            "max_output_tokens":output.min(4096),
+            "capabilities":{"tool_use":tools,"parallel_tool_calls":parallel,"images":false,
+                "reasoning":reasoning,"preserve_reasoning":preserve,"interleaved_reasoning":interleave,
+                "upstream_images":images}}));
+    }
+    if models.is_empty() {
+        return Err("empty usable model catalog");
+    }
+    models.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    Ok(models)
+}
+
+pub fn select_model(r: &mut Value, catalog: &[Value]) -> Result<(), &'static str> {
+    let model = catalog
+        .iter()
+        .find(|m| m["id"] == r["model"])
+        .ok_or("unknown or unavailable model UID")?;
+    let cap = model["max_output_tokens"]
+        .as_u64()
+        .ok_or("invalid catalog output limit")?;
+    if r["max_tokens"].as_u64().is_some_and(|n| n > cap) {
+        return Err("max_tokens exceeds model output limit");
+    }
+    if r.get("max_tokens").is_none() {
+        r["max_tokens"] = json!(cap);
+    }
+    if r["tools"].as_array().is_some_and(|t| !t.is_empty())
+        && model["capabilities"]["tool_use"] != true
+    {
+        return Err("model does not support tools");
+    }
+    if model["capabilities"]["parallel_tool_calls"] != true {
+        if r["parallel_tool_calls"] == true {
+            return Err("model does not support parallel tools");
+        }
+        r["parallel_tool_calls"] = json!(false);
+    }
+    Ok(())
 }
 
 pub fn bootstrap() -> Result<Credentials, &'static str> {
@@ -98,8 +292,12 @@ pub fn validate(r: &Value) -> Result<HashSet<String>, &'static str> {
             "temperature",
         ],
     )?;
-    if r["model"] != MODEL || r["stream"] != true {
-        return Err("only streaming swe-2-flash-medium supported");
+    let model = nonempty(&r["model"])?;
+    if model.len() > 256
+        || model.chars().any(|c| c.is_control() || c.is_whitespace())
+        || r["stream"] != true
+    {
+        return Err("a model UID and streaming are required");
     }
     if let Some(n) = r.get("max_tokens")
         && !n.as_u64().is_some_and(|n| (1..=4096).contains(&n))
@@ -118,9 +316,9 @@ pub fn validate(r: &Value) -> Result<HashSet<String>, &'static str> {
         return Err("only default temperature supported");
     }
     if r.get("parallel_tool_calls")
-        .is_some_and(|v| v != &Value::Bool(true))
+        .is_some_and(|v| !v.is_boolean())
     {
-        return Err("only default parallel_tool_calls supported");
+        return Err("parallel_tool_calls must be boolean");
     }
     if let Some(options) = r.get("stream_options") {
         keys(options, &["include_usage"])?;
@@ -358,6 +556,9 @@ fn encode(r: &Value, meta: &[u8], session: &str) -> Vec<u8> {
     v(&mut options, 7, 40);
     fixed(&mut options, 8, 0.95);
     b(&mut out, 8, &options);
+    if r["parallel_tool_calls"] == false {
+        v(&mut out, 11, 1);
+    }
     if let Some(tools) = r["tools"].as_array() {
         for t in tools {
             let f = &t["function"];
@@ -396,7 +597,7 @@ fn encode(r: &Value, meta: &[u8], session: &str) -> Vec<u8> {
     b(&mut out, 15, &trajectory);
     s(&mut out, 16, &format!("{session}-cascade"));
     v(&mut out, 20, 1);
-    s(&mut out, 21, MODEL);
+    s(&mut out, 21, r["model"].as_str().unwrap());
     out
 }
 fn headers(client: &reqwest::Client, url: &str, unary: bool) -> reqwest::RequestBuilder {
@@ -519,9 +720,9 @@ fn validate_jwt(jwt: &str) -> Result<(), &'static str> {
     }
     Ok(())
 }
-pub fn chunk(delta: Value, finish: Value) -> String {
+pub fn chunk(model: &str, delta: Value, finish: Value) -> String {
     sse(
-        json!({"id":"chatcmpl-devin","object":"chat.completion.chunk","created":0,"model":MODEL,
+        json!({"id":"chatcmpl-devin","object":"chat.completion.chunk","created":0,"model":model,
         "choices":[{"index":0,"delta":delta,"finish_reason":finish}]}),
     )
 }
@@ -547,8 +748,13 @@ pub fn response_field(n: u64, f: Field<'_>) -> Result<(), &'static str> {
                 });
             }
         }
+        (20, Field::Bytes(b)) => {
+            if !b.is_empty() {
+                return Err("nonempty Gemini signature unsupported");
+            }
+        }
         (11, Field::Varint(0)) => {}
-        (9 | 10 | 21 | 11 | 3 | 5 | 6, _) => {
+        (9 | 10 | 20 | 21 | 11 | 3 | 5 | 6, _) => {
             return Err("unsupported reasoning or incorrect wire type");
         }
         (7, Field::Bytes(b)) => usage(b, false)?,
@@ -650,6 +856,214 @@ fn usage(bytes: &[u8], metrics: bool) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn config(uid: &str, disabled: bool, slot: u64, context: u64, output: u64) -> Vec<u8> {
+        let mut features = Vec::new();
+        for field in [11, 12, 15, 21, 24, 25] {
+            v(&mut features, field, 1);
+        }
+        let mut info = Vec::new();
+        v(&mut info, 4, context);
+        v(&mut info, 13, output);
+        v(&mut info, 22, slot);
+        b(&mut info, 6, &features);
+        let mut config = Vec::new();
+        s(&mut config, 22, uid);
+        s(&mut config, 1, "Display name");
+        v(&mut config, 4, disabled as u64);
+        b(&mut config, 23, &info);
+        config
+    }
+    fn catalog_wire(configs: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for config in configs {
+            b(&mut body, 1, config);
+        }
+        body
+    }
+    #[test]
+    fn catalog_schema_filter_and_capabilities() {
+        let mut configs = vec![config("hidden", true, 0, 0, 0); 1357];
+        for slot in [3, 4, 6, 7] {
+            configs.push(config("hidden", false, slot, 0, 0));
+        }
+        configs.extend([
+            config("one", false, 0, 200000, 64000),
+            config("two", false, 8, 1000000, 2048),
+        ]);
+        let models = decode_models(&catalog_wire(&configs)).unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["context_window"], 200000);
+        assert_eq!(models[0]["max_output_tokens"], 4096);
+        assert_eq!(models[1]["max_output_tokens"], 2048);
+        assert_eq!(models[0]["capabilities"]["images"], false);
+        for key in [
+            "tool_use",
+            "parallel_tool_calls",
+            "reasoning",
+            "preserve_reasoning",
+            "interleaved_reasoning",
+            "upstream_images",
+        ] {
+            assert_eq!(models[0]["capabilities"][key], true);
+        }
+        let mut override_config = config("override", false, 0, 100, 50);
+        v(&mut override_config, 18, 1000);
+        assert_eq!(
+            decode_models(&catalog_wire(&[override_config])).unwrap()[0]["context_window"],
+            1000
+        );
+    }
+    #[test]
+    fn catalog_rejects_malformed_ambiguous_and_unbounded_data() {
+        for body in [
+            vec![],
+            vec![10, 255],
+            vec![8, 1],
+            vec![0; MAX_CATALOG + 1],
+            catalog_wire(&vec![config("duplicate", false, 0, 100, 50); 2]),
+            catalog_wire(&[config("bad uid", false, 0, 100, 50)]),
+            catalog_wire(&[config("missing-context", false, 0, 0, 50)]),
+            catalog_wire(&[config("missing-output", false, 0, 100, 0)]),
+            catalog_wire(&[config("negative", false, 0, u64::MAX, 50)]),
+        ] {
+            assert!(decode_models(&body).is_err());
+        }
+        for field in [22, 18] {
+            let mut bad = config("one", false, 0, 100, 50);
+            s(&mut bad, field, "bad");
+            assert!(decode_models(&catalog_wire(&[bad])).is_err());
+        }
+        for field in [2, 25] {
+            let mut info = Vec::new();
+            v(&mut info, field, 1);
+            let mut hidden = Vec::new();
+            s(&mut hidden, 22, "hidden");
+            b(&mut hidden, 23, &info);
+            assert!(decode_models(&catalog_wire(&[hidden])).is_err());
+        }
+    }
+    #[test]
+    fn two_models_validate_encode_and_stream_exact_uid() {
+        let models = decode_models(&catalog_wire(&[
+            config("one", false, 0, 10000, 5000),
+            config("two", false, 8, 20000, 1024),
+        ]))
+        .unwrap();
+        for uid in ["one", "two"] {
+            let mut r = request();
+            r["model"] = json!(uid);
+            r.as_object_mut().unwrap().remove("max_tokens");
+            validate(&r).unwrap();
+            select_model(&mut r, &models).unwrap();
+            let wire = encode(&r, b"meta", "session");
+            assert_eq!(bytes(&fields(&wire).unwrap(), 21).unwrap(), uid.as_bytes());
+            assert!(
+                chunk(uid, json!({"content":"ok"}), Value::Null)
+                    .contains(&format!("\"model\":\"{uid}\""))
+            );
+        }
+        let mut r = request();
+        r["model"] = json!("unknown");
+        assert!(select_model(&mut r, &models).is_err());
+        r["model"] = json!("two");
+        assert!(select_model(&mut r, &models).is_err());
+    }
+    #[test]
+    fn discovery_metadata_uses_portable_fixed_identity() {
+        let c = parse_bootstrap(br#"{"api_key":"synthetic","client_version":"1.2.3"}"#).unwrap();
+        let wire = discovery_request(&c);
+        let outer = fields(&wire).unwrap();
+        let meta = fields(bytes(&outer, 1).unwrap()).unwrap();
+        for field in [1, 12] {
+            assert_eq!(bytes(&meta, field).unwrap(), b"chisel");
+        }
+        for field in [2, 7] {
+            assert_eq!(bytes(&meta, field).unwrap(), b"0.0.0-dev");
+        }
+        assert_eq!(bytes(&meta, 3).unwrap(), b"synthetic");
+        assert_eq!(bytes(&meta, 30).unwrap(), &[3, 4, 6, 7, 8]);
+    }
+    #[tokio::test]
+    async fn catalog_transport_is_offline_bounded_and_strict() {
+        for (status, content_type, body) in [
+            (
+                200,
+                "application/proto",
+                catalog_wire(&[config("one", false, 0, 1000, 100)]),
+            ),
+            (302, "application/proto", vec![]),
+            (200, "application/json", vec![]),
+            (200, "application/proto", vec![0; MAX_CATALOG + 1]),
+        ] {
+            let expected =
+                status == 200 && content_type == "application/proto" && body.len() < MAX_CATALOG;
+            let app = Router::new().route(
+                "/",
+                post(move || async move {
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", content_type)
+                        .body(Body::from(body))
+                        .unwrap()
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            assert_eq!(
+                read_models(client.post(format!("http://{address}/")))
+                    .await
+                    .is_ok(),
+                expected
+            );
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn chat_structure_precedes_discovery_and_unknown_models_never_generate() {
+        let c = parse_bootstrap(br#"{"api_key":"synthetic","client_version":"1.2.3"}"#).unwrap();
+        let app = Arc::new(App {
+            key: "x".repeat(32),
+            live: Some(c),
+            upstream: offline_url("http://127.0.0.1:1").unwrap(),
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            slots: Arc::new(Semaphore::new(1)),
+            catalog: RwLock::new(None),
+        });
+        let send = |value: Value| {
+            let mut req = Request::new(Body::from(value.to_string()));
+            req.headers_mut().insert(
+                "authorization",
+                format!("Bearer {}", app.key).parse().unwrap(),
+            );
+            req.headers_mut()
+                .insert("content-type", "application/json".parse().unwrap());
+            req
+        };
+        let malformed = json!({"model":"one","stream":true,"messages":[]});
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            chat(State(app.clone()), send(malformed)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let models = decode_models(&catalog_wire(&[config("one", false, 0, 10000, 4096)])).unwrap();
+        *app.catalog.write().await = Some((std::time::Instant::now(), models));
+        let mut r = request();
+        r["model"] = json!("unknown");
+        assert_eq!(
+            chat(State(app.clone()), send(r)).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(app.slots.available_permits(), 1);
+    }
+    const MODEL: &str = "swe-2-flash-medium";
     fn request() -> Value {
         json!({"model":MODEL,"stream":true,"user":"abc123","messages":[{"role":"system","content":"system"},{"role":"user","content":"BETA_OK"}],"max_tokens":4096})
     }
@@ -659,7 +1073,7 @@ mod tests {
         assert!(parse_bootstrap(br#"{"api_key":"private","client_version":"latest"}"#).is_err());
         assert!(validate(&request()).is_ok());
         for (key, value) in [
-            ("model", json!("other")),
+            ("model", json!("")),
             ("max_tokens", json!(4097)),
             ("user", json!("../bad")),
             ("reasoning", json!("signed")),
@@ -670,14 +1084,89 @@ mod tests {
         }
     }
     #[test]
-    fn parallel_tool_calls_only_accepts_default() {
+    fn parallel_tool_calls_accepts_only_booleans() {
         let mut r = request();
         assert!(validate(&r).is_ok());
         r["parallel_tool_calls"] = json!(true);
         assert!(validate(&r).is_ok());
-        for value in [json!(false), json!(null), json!("true"), json!(1)] {
+        r["parallel_tool_calls"] = json!(false);
+        assert!(validate(&r).is_ok());
+        for value in [json!(null), json!("true"), json!(1), json!([]), json!({})] {
             r["parallel_tool_calls"] = value;
             assert!(validate(&r).is_err());
+        }
+    }
+    #[test]
+    fn parallel_capability_and_request_encode_serial_mode_once() {
+        let mut models =
+            decode_models(&catalog_wire(&[config(MODEL, false, 0, 10000, 4096)])).unwrap();
+        for supported in [false, true] {
+            models[0]["capabilities"]["parallel_tool_calls"] = json!(supported);
+            for tools in [
+                None,
+                Some(json!([])),
+                Some(json!([{"type":"function","function":{"name":"echo","parameters":{}}}])),
+            ] {
+                for parallel in [None, Some(false), Some(true)] {
+                    let mut r = request();
+                    if let Some(tools) = &tools {
+                        r["tools"] = tools.clone();
+                    }
+                    if let Some(parallel) = parallel {
+                        r["parallel_tool_calls"] = json!(parallel);
+                    }
+                    validate(&r).unwrap();
+                    if !supported && parallel == Some(true) {
+                        assert_eq!(
+                            select_model(&mut r, &models),
+                            Err("model does not support parallel tools")
+                        );
+                        continue;
+                    }
+                    select_model(&mut r, &models).unwrap();
+                    let selected = r.clone();
+                    select_model(&mut r, &models).unwrap();
+                    assert_eq!(r, selected);
+                    let wire = encode(&r, b"meta", "session");
+                    assert_eq!(wire, encode(&r, b"meta", "session"));
+                    let fs = fields(&wire).unwrap();
+                    let disable: Vec<_> = fs.iter().filter(|(n, _)| *n == 11).collect();
+                    if !supported || parallel == Some(false) {
+                        assert_eq!(disable.len(), 1);
+                        assert!(matches!(disable[0], (11, Field::Varint(1))));
+                    } else {
+                        assert!(disable.is_empty());
+                    }
+                    assert_eq!(
+                        fs.iter().filter(|(n, _)| *n == 10).count(),
+                        usize::from(
+                            tools
+                                .as_ref()
+                                .is_some_and(|t| !t.as_array().unwrap().is_empty())
+                        )
+                    );
+                    let options = fields(bytes(&fs, 8).unwrap()).unwrap();
+                    assert!(!options.iter().any(|(n, _)| *n == 11));
+                }
+            }
+        }
+    }
+    #[test]
+    fn gemini_signature_bytes_and_wire_types_fail_closed() {
+        assert!(response_field(20, Field::Bytes(b"")).is_ok());
+        for bytes in [b"signed".as_slice(), &[0xff, 0x00]] {
+            assert_eq!(
+                response_field(20, Field::Bytes(bytes)),
+                Err("nonempty Gemini signature unsupported")
+            );
+        }
+        for field in [
+            Field::Varint(0),
+            Field::Varint(1),
+            Field::Fixed(&[0; 4]),
+            Field::Fixed(&[0; 8]),
+        ] {
+            assert!(response_field(20, field).is_err());
         }
     }
     #[test]

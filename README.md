@@ -38,12 +38,14 @@ require a compatible glibc. Binaries are not signed or notarized.
 
 `client_version` must be a numeric three-part version. Supply an explicitly
 chosen compatible version; the helper does not discover an installed client or
-read credential files. The protocol currently identifies as `devin-desktop`.
+read credential files. Chat identifies as `devin-desktop`; discovery uses the
+fixed `chisel` / `0.0.0-dev` metadata identity.
 The example values above are placeholders, not working credentials.
 
 Read the first stdout line for the allocated `127.0.0.1:PORT` address. Configure
-your client with base URL `http://127.0.0.1:PORT/v1`, the local bearer key, model
-`swe-2-flash-medium`, and streaming enabled. Keep the process running for the
+your client with base URL `http://127.0.0.1:PORT/v1`, the local bearer key, and
+streaming enabled. Fetch `GET /v1/models` with that bearer key and select an exact
+returned `id` as the chat model; labels are not model IDs. Keep the process running for the
 client's session; terminate it when finished. There is no fixed port or automatic
 restart. Never put provider credentials in command arguments, shell history,
 checked-in files, or request logs.
@@ -51,15 +53,38 @@ checked-in files, or request logs.
 ## Supported API
 
 - `POST /v1/chat/completions`, bearer-authenticated, streaming SSE only.
-- Only `swe-2-flash-medium`; output limited to 1–4,096 tokens.
+- `GET /v1/models`, bearer-authenticated, returns `{"object":"list","data":[...]}`.
+  Each model has `id` (exact upstream UID), `object:"model"`, `owned_by:"devin"`,
+  `name`, `context_window`, `max_output_tokens`, and `capabilities`. Capability
+  booleans are `tool_use`, `parallel_tool_calls`, `images`, `reasoning`,
+  `preserve_reasoning`, `interleaved_reasoning`, and `upstream_images`.
+  `images` is always false: upstream image support is informational only, and
+  image requests remain unsupported. Reasoning flags describe unsigned history,
+  not signed/redacted state support.
+- Catalogs come from the fixed HTTPS `GetCliModelConfigs` RPC, with a 30-second
+  timeout and 8 MiB response bound. Successful results are shared for 15 minutes;
+  GET and chat reuse the cache, refreshing lazily on expiry. No CLI or credential
+  file lookup is used. Discovery errors, empty catalogs, malformed metadata and
+  ambiguous duplicate IDs fail closed; expired data is not a fallback.
+- Only enabled public non-router configs in normal display slots (0 or 8), with
+  positive context/output limits, are eligible. Chat rejects unknown model IDs
+  before generation. Output is limited to the lesser of the model limit and
+  4,096 tokens; omitted `max_tokens` uses that cap.
 - Text system/user/assistant messages, function calls/results, and unsigned
   reasoning history. The client must resend the conversation history.
 - An optional `user` field provides session identity; use a distinct value for
   each independent conversation. Without it, each request gets a fresh identity.
 - The client executes tools and must implement its own approval policy. This
   helper does not execute tools or supply an agent sandbox.
-- Unsupported fields are rejected. No Responses API, model-list endpoint,
-  embeddings, images, non-streaming mode, signed or redacted reasoning support.
+- Unsupported fields are rejected. No Responses API, embeddings, images,
+  non-streaming mode, signed or redacted reasoning support.
+
+The discovery field mapping is checked against the public
+[`devin-proto.ts`](https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/discovery/devin-proto.ts)
+and [`devin.ts`](https://github.com/can1357/oh-my-pi/blob/main/packages/catalog/src/discovery/devin.ts)
+schemas. In particular, config field 4 is `disabled`, not image support. The helper
+does not collapse model families or substitute aliases; encoded requests and all
+SSE chunks (including usage) preserve the selected UID.
 
 Tools and the final completion marker are withheld until the upstream response
 passes terminal validation. Partial text may already have streamed when an error
@@ -85,9 +110,19 @@ mode; it is not an alternative provider configuration.
 
 Update the Cargo package version and lockfile, then push a matching `v<version>`
 tag after reviewing the changes. GitHub Actions tests each native target, builds
-release binaries with remapped build paths, packages only the executable, verifies
-checksums and publishes a release only after every target succeeds. Tagging and
-publishing are maintainer actions, not performed by local builds.
+release binaries with remapped build paths, packages the executable and license,
+verifies checksums and publishes a release only after every target succeeds.
+Tagging and publishing are maintainer actions, not performed by local builds.
+
+Version 0.2.0 adds dynamic model discovery through `/v1/models`; version 0.1.0
+cannot serve that endpoint. Existing binaries do not update themselves. To update,
+download the archive for your platform and `SHA256SUMS` from the same release,
+verify the archive's SHA-256 checksum, then extract it into a temporary directory.
+Stop clients and bridge processes before replacing the executable at the path you
+configured, preserving its executable permission on Unix. Restart clients with
+fresh conversations and refresh their model catalog. Do not overwrite a different
+executable found on PATH or a client-managed installation without checking which
+path the client actually uses.
 
 ## License
 

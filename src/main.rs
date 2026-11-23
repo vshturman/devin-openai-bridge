@@ -4,12 +4,12 @@ use axum::{
     extract::{DefaultBodyLimit, FromRequest, Request, State},
     http::StatusCode,
     response::Response,
-    routing::post,
+    routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 
 mod live;
 
@@ -26,6 +26,7 @@ struct App {
     upstream: reqwest::Url,
     client: reqwest::Client,
     slots: Arc<Semaphore>,
+    catalog: RwLock<Option<(std::time::Instant, Vec<Value>)>>,
 }
 
 #[tokio::main]
@@ -58,6 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
         slots: Arc::new(Semaphore::new(5)),
+        catalog: RwLock::new(None),
     });
     let router = router(app);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -69,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/models", get(models))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(app)
 }
@@ -98,6 +101,54 @@ fn reject(status: StatusCode, message: &'static str) -> Response {
             json!({"error":{"message":message,"type":"offline_bridge_error"}}).to_string(),
         ))
         .unwrap()
+}
+
+async fn catalog(app: &App) -> Result<Vec<Value>, &'static str> {
+    let fresh = |entry: &Option<(std::time::Instant, Vec<Value>)>| {
+        entry
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(900))
+            .map(|(_, models)| models.clone())
+    };
+    if let Some(models) = fresh(&*app.catalog.read().await) {
+        return Ok(models);
+    }
+    let mut cache = app.catalog.write().await;
+    if let Some(models) = fresh(&cache) {
+        return Ok(models);
+    }
+    let credentials = app
+        .live
+        .as_ref()
+        .ok_or("model discovery requires live credentials")?;
+    // Never reuse an expired catalog after a failed refresh.
+    *cache = None;
+    let models = live::fetch_models(&app.client, credentials).await?;
+    *cache = Some((std::time::Instant::now(), models.clone()));
+    Ok(models)
+}
+
+async fn models(State(app): State<Arc<App>>, request: Request) -> Response {
+    if request
+        .headers()
+        .get("authorization")
+        .and_then(|h| h.to_str().ok())
+        != Some(&format!("Bearer {}", app.key))
+    {
+        return reject(StatusCode::UNAUTHORIZED, "authentication required");
+    }
+    let _permit = match app.slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => return reject(StatusCode::TOO_MANY_REQUESTS, "concurrency limit reached"),
+    };
+    match catalog(&app).await {
+        Ok(data) => Response::builder()
+            .header("content-type", "application/json")
+            .header("cache-control", "no-store")
+            .body(Body::from(json!({"object":"list","data":data}).to_string()))
+            .unwrap(),
+        Err(message) => reject(StatusCode::BAD_GATEWAY, message),
+    }
 }
 
 async fn chat(State(app): State<Arc<App>>, request: Request) -> Response {
@@ -163,6 +214,16 @@ async fn chat(State(app): State<Arc<App>>, request: Request) -> Response {
         Ok(names) => names,
         Err(message) => return reject(StatusCode::BAD_REQUEST, message),
     };
+    let mut request = request;
+    if app.live.is_some() {
+        let catalog = match catalog(&app).await {
+            Ok(catalog) => catalog,
+            Err(message) => return reject(StatusCode::BAD_GATEWAY, message),
+        };
+        if let Err(message) = live::select_model(&mut request, &catalog) {
+            return reject(StatusCode::BAD_REQUEST, message);
+        }
+    }
     let (tx, rx) = mpsc::channel::<String>(8);
     tokio::spawn(async move {
         let _permit = permit;
@@ -281,6 +342,7 @@ async fn bridge(
         tx,
         app.live.is_some(),
         request["stream_options"]["include_usage"] == true,
+        request["model"].as_str().unwrap(),
     )
     .await
 }
@@ -291,10 +353,11 @@ async fn relay(
     tx: &mpsc::Sender<String>,
     live: bool,
     include_usage: bool,
+    model: &str,
 ) -> Result<(), &'static str> {
     let chunk = |delta, finish| {
         if live {
-            live::chunk(delta, finish)
+            live::chunk(model, delta, finish)
         } else {
             chunk(delta, finish)
         }
@@ -335,7 +398,7 @@ async fn relay(
             .map_err(|_| "client cancelled")?;
     }
     if live && include_usage && !usage.is_null() {
-        tx.send(sse(json!({"id":"chatcmpl-devin","object":"chat.completion.chunk","model":live::MODEL,"created":0,"choices":[],"usage":usage})))
+        tx.send(sse(json!({"id":"chatcmpl-devin","object":"chat.completion.chunk","model":model,"created":0,"choices":[],"usage":usage})))
             .await.map_err(|_| "client cancelled")?;
     }
     tx.send(chunk(
@@ -601,10 +664,13 @@ fn varint(bytes: &[u8], pos: &mut usize) -> Result<u64, &'static str> {
     Err("varint overflow")
 }
 fn fields(bytes: &[u8]) -> Result<Vec<(u64, Field<'_>)>, &'static str> {
+    fields_limit(bytes, 1024)
+}
+fn fields_limit(bytes: &[u8], limit: usize) -> Result<Vec<(u64, Field<'_>)>, &'static str> {
     let mut pos = 0;
     let mut out = Vec::new();
     while pos < bytes.len() {
-        if out.len() >= 1024 {
+        if out.len() >= limit {
             return Err("field count limit");
         }
         let tag = varint(bytes, &mut pos)?;
