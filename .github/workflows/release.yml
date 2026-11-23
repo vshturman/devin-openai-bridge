@@ -1,0 +1,179 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - name: Match tag to root package and check binary name
+        run: |
+          cargo +stable metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = json.loads((Path(os.environ['RUNNER_TEMP']) / 'metadata.json').read_text())
+          manifest = Path('Cargo.toml').resolve()
+          package = next(p for p in metadata['packages'] if Path(p['manifest_path']).resolve() == manifest)
+          expected = 'v' + package['version']
+          if os.environ['GITHUB_REF_NAME'] != expected:
+              raise SystemExit(f'Tag must be {expected}, matching the root Cargo.toml package version')
+          if not any(t['name'] == 'devin-helper' and 'bin' in t['kind'] for t in package['targets']):
+              raise SystemExit('Root package must provide the devin-helper binary')
+          PY
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust and verify native target
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustc +stable -vV | grep -Fx "host: $TARGET"
+      - name: Remap build paths for public binaries
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          from pathlib import Path
+
+          # Encoded flags preserve spaces and native Windows paths without shell conversion.
+          roots = [(str(Path.home()), '/home/rust'), (os.environ['HOME'], '/home/rust')]
+          roots += [(subprocess.check_output(['rustc', '+stable', '--print', 'sysroot'], text=True).strip(), '/rust/toolchain')]
+          roots += [(str(Path.cwd()), '.'), (os.environ['GITHUB_WORKSPACE'], '.')]
+          flags = []
+          for source, replacement in roots:
+              for spelling in dict.fromkeys([source, source.replace('\\', '/')]):
+                  flags.append(f'--remap-path-prefix={spelling}={replacement}')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write('CARGO_ENCODED_RUSTFLAGS=' + '\x1f'.join(flags) + '\n')
+          PY
+      - name: Test release profile on native target
+        run: cargo +stable test --release --locked --workspace --target "$TARGET"
+      - name: Build compatibility binary
+        run: cargo +stable build --release --locked --bin devin-helper --target "$TARGET"
+      - name: Package binary and checksum
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          target = os.environ['TARGET']
+          windows = target.endswith('windows-msvc')
+          binary = 'devin-helper.exe' if windows else 'devin-helper'
+          source = Path('target') / target / 'release' / binary
+          dist = Path('dist')
+          dist.mkdir(exist_ok=True)
+          name = f"devin-helper-{os.environ['GITHUB_REF_NAME']}-{target}"
+          archive = dist / (name + ('.zip' if windows else '.tar.gz'))
+          if windows:
+              with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as bundle:
+                  entry = zipfile.ZipInfo(binary)
+                  entry.compress_type = zipfile.ZIP_DEFLATED
+                  bundle.writestr(entry, source.read_bytes())
+          else:
+              with tarfile.open(archive, 'w:gz') as bundle:
+                  entry = tarfile.TarInfo(binary)
+                  entry.size = source.stat().st_size
+                  entry.mode = 0o755
+                  with source.open('rb') as executable:
+                      bundle.addfile(entry, executable)
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          (dist / (archive.name + '.sha256')).write_text(f'{digest}  {archive.name}\n', encoding='utf-8')
+          PY
+      - name: Upload release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish complete release
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download all release candidates
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - name: Verify all five packages and assemble checksums
+        working-directory: dist
+        run: |
+          shopt -s nullglob
+          archives=(*.tar.gz *.zip)
+          checksums=(*.sha256)
+          [[ ${#archives[@]} -eq 5 && ${#checksums[@]} -eq 5 ]]
+          cat -- "${checksums[@]}" > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - name: Upload assets to draft, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # A failed upload leaves only a draft; reruns can finish that draft safely.
+          if gh release view "$TAG" --json isDraft > "$RUNNER_TEMP/release.json"; then
+            python -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1]))["isDraft"] else "Refusing to modify an already published release")' "$RUNNER_TEMP/release.json"
+          else
+            prerelease=()
+            if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
+            gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes "${prerelease[@]}"
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber
+          gh release edit "$TAG" --draft=false
