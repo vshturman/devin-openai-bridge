@@ -16,7 +16,8 @@ mod live;
 const MAX_BODY: usize = 1024 * 1024;
 const MAX_WIRE: usize = 1024 * 1024;
 const MAX_FRAME: usize = 64 * 1024;
-const MAX_EVENTS: usize = 8192;
+const MAX_EVENTS: usize = 131072;
+const MAX_STREAM: usize = 16 * 1024 * 1024;
 const MAX_TEXT: usize = 512 * 1024;
 const DEADLINE: Duration = Duration::from_secs(10);
 
@@ -510,7 +511,7 @@ impl Decoder {
     }
     fn push_inner(&mut self, bytes: &[u8], texts: &mut Vec<Output>) -> Result<(), &'static str> {
         self.wire = self.wire.checked_add(bytes.len()).ok_or("wire limit")?;
-        if self.wire > MAX_WIRE {
+        if self.wire > MAX_STREAM {
             return Err("wire limit");
         }
         for byte in bytes {

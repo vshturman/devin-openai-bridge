@@ -152,7 +152,7 @@ fn wire_and_structure_bounds() {
     assert!(fields(&[40, 255, 255, 255, 255, 255, 255, 255, 255, 255, 2]).is_err());
     assert!(decode(&frame(0, &[26, 1, 255])).is_err());
     let mut decoder = Decoder::new(HashSet::new());
-    assert!(decoder.push(&vec![0; MAX_WIRE + 1]).is_err());
+    assert!(decoder.push(&vec![0; MAX_STREAM + 1]).is_err());
 }
 #[test]
 fn offline_boundary_and_replay_refusal() {
