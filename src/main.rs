@@ -422,14 +422,25 @@ async fn relay(
         result?;
     }
     let usage = decoder.usage.clone();
+    let truncated = decoder.truncated;
     let tools = decoder.complete()?;
+    if truncated {
+        tx.send(chunk(
+            json!({"content":"\n\n[Devin stopped: output token limit reached; the reply is incomplete. Ask it to continue.]"}),
+            Value::Null,
+        ))
+        .await
+        .map_err(|_| "client cancelled")?;
+    }
     for (i, t) in tools.iter().enumerate() {
         let call = json!({"index":i,"id":t.id,"type":"function","function":{"name":t.name,"arguments":t.args}});
         tx.send(chunk(json!({"tool_calls":[call]}), Value::Null))
             .await
             .map_err(|_| "client cancelled")?;
     }
-    let finish = json!(if tools.is_empty() {
+    let finish = json!(if truncated {
+        "length"
+    } else if tools.is_empty() {
         "stop"
     } else {
         "tool_calls"
@@ -479,6 +490,7 @@ struct Decoder {
     tools: Vec<Tool>,
     names: HashSet<String>,
     live: bool,
+    truncated: bool,
     usage: Value,
     usage_counts: Value,
 }
@@ -494,6 +506,7 @@ impl Decoder {
             tools: Vec::new(),
             names,
             live: false,
+            truncated: false,
             usage: Value::Null,
             usage_counts: json!({}),
         }
@@ -541,7 +554,11 @@ impl Decoder {
                         } else {
                             trailer != json!({})
                         } {
-                            return Err("nonempty or error trailer");
+                            return Err(if self.live {
+                                live::trailer_error(&trailer)
+                            } else {
+                                "nonempty or error trailer"
+                            });
                         }
                         self.eos = true;
                     } else {
@@ -582,6 +599,7 @@ impl Decoder {
                     match n {
                         0 | 2 | 4 | 6 | 8 | 10 | 12 => {}
                         1 => return Err("upstream finish: incomplete"),
+                        3 if self.live && self.tools.is_empty() => self.truncated = true,
                         3 => return Err("upstream finish: max tokens"),
                         5 => return Err("upstream finish: max newlines"),
                         7 => return Err("upstream finish: nonfinite probability"),
@@ -617,12 +635,17 @@ impl Decoder {
                         }
                     }
                     if let (Some(id), Some(name)) = (&id, &name) {
-                        if id.is_empty()
-                            || !self.names.contains(name)
-                            || self.tools.iter().any(|t| t.id == *id)
-                            || self.tools.len() >= 32
-                        {
-                            return Err("invalid, unknown or duplicate tool");
+                        if id.is_empty() {
+                            return Err("invalid tool: empty id");
+                        }
+                        if !self.names.contains(name) {
+                            return Err("invalid tool: name not declared in request");
+                        }
+                        if self.tools.iter().any(|t| t.id == *id) {
+                            return Err("invalid tool: duplicate id");
+                        }
+                        if self.tools.len() >= 32 {
+                            return Err("invalid tool: more than 32 calls");
                         }
                         self.tools.push(Tool {
                             id: id.clone(),

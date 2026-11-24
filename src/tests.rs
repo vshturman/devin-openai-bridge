@@ -113,7 +113,7 @@ fn finish_tool_consistency_live_and_offline() {
                 let expected = if with_tool {
                     reason == 10 || (live && normal_stop)
                 } else {
-                    normal_stop
+                    normal_stop || (live && reason == 3)
                 };
                 assert_eq!(
                     result.is_ok(),
@@ -1220,4 +1220,35 @@ async fn authenticated_models_http_and_cache_expiry_fail_closed() {
         get().send().await.unwrap().status(),
         StatusCode::BAD_GATEWAY
     );
+}
+
+#[test]
+fn live_max_tokens_without_tools_is_a_truncated_success_but_with_tools_is_an_error() {
+    let mut decoder = Decoder::new(HashSet::from(["f".into()]));
+    decoder.live = true;
+    decoder
+        .push(&[frame(0, &[40, 3]), frame(2, b"{}")].concat())
+        .unwrap();
+    assert!(decoder.truncated);
+    assert!(decoder.complete().unwrap().is_empty());
+    let mut offline = Decoder::new(HashSet::from(["f".into()]));
+    assert_eq!(
+        offline
+            .push(&[frame(0, &[40, 3]), frame(2, b"{}")].concat())
+            .unwrap_err(),
+        "upstream finish: max tokens"
+    );
+}
+
+#[test]
+fn live_trailer_error_code_is_surfaced() {
+    assert_eq!(
+        live::trailer_error(&json!({"error": {"code": "resource_exhausted", "message": "x"}})),
+        "upstream error trailer: resource_exhausted"
+    );
+    assert_eq!(
+        live::trailer_error(&json!({"error": {"code": "failed_precondition", "message": "Daily quota exceeded"}})),
+        "upstream quota exhausted (daily or plan usage limit reached)"
+    );
+    assert_eq!(live::trailer_error(&json!({"error": {}})), "nonempty or error trailer");
 }

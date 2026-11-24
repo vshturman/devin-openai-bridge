@@ -849,6 +849,38 @@ pub fn chunk(model: &str, delta: Value, finish: Value) -> String {
         "choices":[{"index":0,"delta":delta,"finish_reason":finish}]}),
     )
 }
+pub fn trailer_error(v: &Value) -> &'static str {
+    let message = v
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ["quota", "usage limit", "daily limit", "limit reached", "out of credits", "insufficient credit"]
+        .iter()
+        .any(|k| message.contains(k))
+    {
+        return "upstream quota exhausted (daily or plan usage limit reached)";
+    }
+    match v.pointer("/error/code").and_then(Value::as_str) {
+        Some("canceled") => "upstream error trailer: canceled",
+        Some("unknown") => "upstream error trailer: unknown",
+        Some("invalid_argument") => "upstream error trailer: invalid_argument",
+        Some("deadline_exceeded") => "upstream error trailer: deadline_exceeded",
+        Some("not_found") => "upstream error trailer: not_found",
+        Some("already_exists") => "upstream error trailer: already_exists",
+        Some("permission_denied") => "upstream error trailer: permission_denied",
+        Some("resource_exhausted") => "upstream error trailer: resource_exhausted",
+        Some("failed_precondition") => "upstream error trailer: failed_precondition",
+        Some("aborted") => "upstream error trailer: aborted",
+        Some("out_of_range") => "upstream error trailer: out_of_range",
+        Some("unimplemented") => "upstream error trailer: unimplemented",
+        Some("internal") => "upstream error trailer: internal",
+        Some("unavailable") => "upstream error trailer: unavailable",
+        Some("data_loss") => "upstream error trailer: data_loss",
+        Some("unauthenticated") => "upstream error trailer: unauthenticated",
+        _ => "nonempty or error trailer",
+    }
+}
 pub fn valid_trailer(v: &Value) -> bool {
     v.as_object().is_some_and(|o| {
         !o.contains_key("error")
