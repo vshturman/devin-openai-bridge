@@ -401,19 +401,7 @@ async fn relay(
             chunk(delta, finish)
         }
     };
-    if response.status() != reqwest::StatusCode::OK
-        || response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            != Some("application/connect+proto")
-        || response
-            .headers()
-            .get("content-encoding")
-            .is_some_and(|v| v != "identity")
-    {
-        return Err("unexpected synthetic upstream response");
-    }
+    live::check_response(&response, "application/connect+proto")?;
     let mut decoder = Decoder::new(names);
     decoder.live = live;
     let mut bytes = response.bytes_stream();

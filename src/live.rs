@@ -730,17 +730,26 @@ fn headers(client: &reqwest::Client, url: &str, unary: bool) -> reqwest::Request
         .header("Connect-Accept-Encoding", "identity")
         .header("Accept-Encoding", "identity")
 }
-fn check_response(r: &reqwest::Response, expected: &str) -> Result<(), &'static str> {
-    if r.status() != reqwest::StatusCode::OK
-        || r.headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            != Some(expected)
-        || r.headers()
-            .get("content-encoding")
-            .is_some_and(|v| v != "identity")
+pub fn check_response(r: &reqwest::Response, expected: &str) -> Result<(), &'static str> {
+    match r.status().as_u16() {
+        200 => {}
+        401 | 403 => return Err("upstream HTTP 401/403 (auth rejected)"),
+        429 => return Err("upstream HTTP 429 (rate limited)"),
+        500..=599 => return Err("upstream HTTP 5xx (server error)"),
+        _ => return Err("unexpected upstream HTTP status"),
+    }
+    if r.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        != Some(expected)
     {
-        return Err("unexpected live response status/encoding");
+        return Err("unexpected upstream content type");
+    }
+    if r.headers()
+        .get("content-encoding")
+        .is_some_and(|v| v != "identity")
+    {
+        return Err("unexpected upstream content encoding");
     }
     Ok(())
 }
@@ -1179,6 +1188,45 @@ mod tests {
             assert!(decode_quota(&bad).is_err());
         }
     }
+    #[test]
+    fn response_errors_name_the_failed_check() {
+        let response = |status: u16, content_type: &str, encoding: Option<&str>| {
+            let mut r = axum::http::Response::builder()
+                .status(status)
+                .header("content-type", content_type);
+            if let Some(e) = encoding {
+                r = r.header("content-encoding", e);
+            }
+            reqwest::Response::from(r.body(Vec::<u8>::new()).unwrap())
+        };
+        let ct = "application/connect+proto";
+        for (status, content_type, encoding, expected) in [
+            (200, ct, None, Ok(())),
+            (200, ct, Some("identity"), Ok(())),
+            (401, ct, None, Err("upstream HTTP 401/403 (auth rejected)")),
+            (403, ct, None, Err("upstream HTTP 401/403 (auth rejected)")),
+            (429, ct, None, Err("upstream HTTP 429 (rate limited)")),
+            (503, ct, None, Err("upstream HTTP 5xx (server error)")),
+            (404, ct, None, Err("unexpected upstream HTTP status")),
+            (
+                200,
+                "text/html",
+                None,
+                Err("unexpected upstream content type"),
+            ),
+            (
+                200,
+                ct,
+                Some("gzip"),
+                Err("unexpected upstream content encoding"),
+            ),
+        ] {
+            assert_eq!(
+                check_response(&response(status, content_type, encoding), ct),
+                expected
+            );
+        }
+    }
     #[tokio::test]
     async fn quota_transport_is_bounded_and_strict() {
         let good = br#"{"userStatus":{"planStatus":{"dailyQuotaRemainingPercent":40}}}"#;
@@ -1194,13 +1242,13 @@ mod tests {
                 302,
                 "application/json",
                 vec![],
-                Err("unexpected live response status/encoding"),
+                Err("unexpected upstream HTTP status"),
             ),
             (
                 200,
                 "text/html",
                 good.to_vec(),
-                Err("unexpected live response status/encoding"),
+                Err("unexpected upstream content type"),
             ),
             (
                 200,
