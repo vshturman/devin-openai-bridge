@@ -35,6 +35,10 @@ struct App {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let (live, upstream) = match args.next().as_deref() {
+        Some("--version" | "-V") => {
+            println!("devin-helper {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         Some("--live") => (Some(live::bootstrap()?), reqwest::Url::parse(live::CHAT)?),
         Some("--offline-upstream") => (
             None,

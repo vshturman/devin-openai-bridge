@@ -855,9 +855,16 @@ pub fn trailer_error(v: &Value) -> &'static str {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
-    if ["quota", "usage limit", "daily limit", "limit reached", "out of credits", "insufficient credit"]
-        .iter()
-        .any(|k| message.contains(k))
+    if [
+        "quota",
+        "usage limit",
+        "daily limit",
+        "limit reached",
+        "out of credits",
+        "insufficient credit",
+    ]
+    .iter()
+    .any(|k| message.contains(k))
     {
         return "upstream quota exhausted (daily or plan usage limit reached)";
     }

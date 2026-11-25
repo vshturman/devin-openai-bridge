@@ -1239,8 +1239,13 @@ fn live_trailer_error_code_is_surfaced() {
         "upstream error trailer: resource_exhausted"
     );
     assert_eq!(
-        live::trailer_error(&json!({"error": {"code": "failed_precondition", "message": "Daily quota exceeded"}})),
+        live::trailer_error(
+            &json!({"error": {"code": "failed_precondition", "message": "Daily quota exceeded"}})
+        ),
         "upstream quota exhausted (daily or plan usage limit reached)"
     );
-    assert_eq!(live::trailer_error(&json!({"error": {}})), "nonempty or error trailer");
+    assert_eq!(
+        live::trailer_error(&json!({"error": {}})),
+        "nonempty or error trailer"
+    );
 }
