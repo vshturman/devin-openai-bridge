@@ -700,8 +700,14 @@ impl Decoder {
         Ok(())
     }
     fn complete(self) -> Result<Vec<Tool>, &'static str> {
-        if !self.eos || !self.pending.is_empty() || self.finish.is_none() {
-            return Err("incomplete response");
+        if !self.pending.is_empty() {
+            return Err("incomplete response: truncated frame");
+        }
+        if !self.eos {
+            return Err("incomplete response: stream ended without trailer");
+        }
+        if self.finish.is_none() {
+            return Err("incomplete response: no finish reason");
         }
         if if self.tools.is_empty() {
             self.finish == Some(10)
