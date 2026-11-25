@@ -894,20 +894,15 @@ pub fn valid_trailer(v: &Value) -> bool {
 }
 pub fn response_field(n: u64, f: Field<'_>) -> Result<(), &'static str> {
     match (n, f) {
-        (9 | 10 | 21, Field::Bytes(b)) => {
+        (9, Field::Bytes(b)) => {
             if !utf8(b)?.is_empty() {
-                return Err(match n {
-                    9 => "nonempty reasoning unsupported",
-                    10 => "nonempty signature unsupported",
-                    _ => "nonempty signature type unsupported",
-                });
+                return Err("nonempty reasoning unsupported");
             }
         }
-        (20, Field::Bytes(b)) => {
-            if !b.is_empty() {
-                return Err("nonempty Gemini signature unsupported");
-            }
+        (10 | 21, Field::Bytes(b)) => {
+            utf8(b)?;
         }
+        (20, Field::Bytes(_)) => {}
         (11, Field::Varint(0)) => {}
         (9 | 10 | 20 | 21 | 11 | 3 | 5 | 6, _) => {
             return Err("unsupported reasoning or incorrect wire type");
@@ -1471,10 +1466,7 @@ mod tests {
     fn gemini_signature_bytes_and_wire_types_fail_closed() {
         assert!(response_field(20, Field::Bytes(b"")).is_ok());
         for bytes in [b"signed".as_slice(), &[0xff, 0x00]] {
-            assert_eq!(
-                response_field(20, Field::Bytes(bytes)),
-                Err("nonempty Gemini signature unsupported")
-            );
+            assert!(response_field(20, Field::Bytes(bytes)).is_ok());
         }
         for field in [
             Field::Varint(0),
@@ -1653,7 +1645,8 @@ mod tests {
         d.push(&eos).unwrap();
         assert_eq!(d.complete().unwrap().len(), 1);
         assert!(response_field(9, Field::Bytes(b"thinking")).is_err());
-        assert!(response_field(10, Field::Bytes(b"signature")).is_err());
+        assert!(response_field(10, Field::Bytes(b"signature")).is_ok());
+        assert!(response_field(10, Field::Bytes(&[0xff])).is_err());
         assert!(response_field(11, Field::Varint(1)).is_err());
         assert!(response_field(7, Field::Varint(1)).is_err());
         assert!(response_field(7, Field::Bytes(&[18, 0])).is_err());

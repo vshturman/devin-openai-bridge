@@ -1042,16 +1042,8 @@ async fn unsigned_reasoning_stream_and_late_signatures_gate_tools() {
         let text: Value =
             serde_json::from_str(events[1].trim().strip_prefix("data: ").unwrap()).unwrap();
         assert_eq!(text["choices"][0]["delta"], json!({"content":"answer"}));
-        if let Some((number, varint)) = tail {
-            assert_eq!(
-                result,
-                Err(match number {
-                    10 => "nonempty signature unsupported",
-                    20 if !varint => "nonempty Gemini signature unsupported",
-                    21 => "nonempty signature type unsupported",
-                    _ => "unsupported reasoning or incorrect wire type",
-                })
-            );
+        if tail.filter(|&(n, v)| (n == 20 && v) || n == 11).is_some() {
+            assert_eq!(result, Err("unsupported reasoning or incorrect wire type"));
             assert_eq!(events.len(), 2);
             assert!(!events.concat().contains("tool_calls"));
             assert!(!events.concat().contains("[DONE]"));
